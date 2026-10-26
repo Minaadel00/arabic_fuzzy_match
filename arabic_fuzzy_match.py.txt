@@ -1,0 +1,225 @@
+!pip install rapidfuzz
+import sys
+import pandas as pd
+from rapidfuzz import process, fuzz
+from tqdm import tqdm
+
+print("Libraries imported.")
+
+# ============================================================
+# Step 1: Advanced Arabic Text Cleaning
+# ============================================================
+def clean_arabic_text(text_series):
+    """
+    Normalizes Arabic text and strips common business/address stopwords.
+    """
+    # Handle missing values BEFORE converting to string, so NaN doesn't
+    # become the literal word "nan" in the search key.
+    text = text_series.fillna('').astype(str)
+
+    # 1. Normalize Arabic letters
+    text = text.str.replace('أ', 'ا').str.replace('إ', 'ا').str.replace('آ', 'ا')
+    text = text.str.replace('ة', 'ه')
+    text = text.str.replace('ى', 'ي')
+    text = text.str.replace('ؤ', 'و').str.replace('ئ', 'ي')
+
+    # 2. Remove multi-word phrases FIRST (before the \b single-word group,
+    #    since a phrase containing internal spaces breaks \b matching).
+    multi_word_stopwords = r'مطلوب سجل تجاري|مطلوب سجل تجارى'
+    text = text.str.replace(multi_word_stopwords, '', regex=True)
+
+    # 3. Remove single-word business & address stopwords
+    business_stopwords = (
+        r'\b(شركة|شركه|مؤسسة|موسسه|مجموعة|مجموعه|مركز|مستشفى|سموم|بدون|'
+        r'نقدي|نقدى|شباك|الاوراق|المرسله|مستشفي|صيدلية|صيدليه|دكتور|د|'
+        r'عيادة|عياده|محل|معرض|سنتر)\b'
+    )
+    address_stopwords = (
+        r'\b(شارع|طريق|حي|منطقة|منطقه|محافظة|مدينه|مدينة|بجوار|امام|خلف|'
+        r'مبنى|عماره|عمارة|ش)\b'
+    )
+    text = text.str.replace(business_stopwords, '', regex=True)
+    text = text.str.replace(address_stopwords, '', regex=True)
+
+    # 4. Remove punctuation/symbols
+    text = text.str.replace(r'[^\w\s]', '', regex=True)
+
+    # 5. Normalize whitespace and case
+    text = text.str.lower().str.strip()
+    text = text.str.replace(r'\s+', ' ', regex=True)
+
+    return text
+
+
+# ============================================================
+# Step 2: Load Data
+# ============================================================
+try:
+    dtype_spec = {'Customer Code': str}
+    df_company = pd.read_excel('sample_data/List.xlsx', dtype=dtype_spec)
+    df_distributor = pd.read_excel('sample_data/Book6.xlsx', dtype=dtype_spec)
+    print("Files loaded successfully.")
+except Exception as e:
+    print(f"Error loading files: {e}")
+    sys.exit(1)
+
+# ============================================================
+# Step 3: Define Column Names
+# ============================================================
+COMPANY_NAME_COL = 'CustomerAName'
+COMPANY_ADDR_COL = 'Address'
+DIST_NAME_COL = 'Customer Name'
+DIST_ADDR_COL = 'Address'
+
+# ============================================================
+# Step 4: Pre-processing / Build Search Keys
+# ============================================================
+print("Creating and cleaning search keys...")
+
+def create_key(df, name_col, addr_col):
+    name_cleaned = clean_arabic_text(df[name_col])
+    addr_cleaned = clean_arabic_text(df[addr_col])
+    return (name_cleaned + ' ' + addr_cleaned).str.strip()
+
+try:
+    df_company['Company_Key'] = create_key(df_company, COMPANY_NAME_COL, COMPANY_ADDR_COL)
+    df_distributor['Distributor_Key'] = create_key(df_distributor, DIST_NAME_COL, DIST_ADDR_COL)
+except KeyError as e:
+    print(f"Error: Column {e} not found in one of the input files.")
+    sys.exit(1)
+
+# Drop rows whose cleaned key ended up empty (nothing usable to match on)
+empty_company_keys = (df_company['Company_Key'] == '').sum()
+empty_dist_keys = (df_distributor['Distributor_Key'] == '').sum()
+if empty_company_keys:
+    print(f"Warning: {empty_company_keys} company rows have an empty key after cleaning.")
+if empty_dist_keys:
+    print(f"Warning: {empty_dist_keys} distributor rows have an empty key after cleaning.")
+
+# ============================================================
+# Step 5: Prepare Choices (dedupe to avoid a fan-out merge later)
+# ============================================================
+n_before = len(df_company)
+company_data_map = df_company.drop_duplicates(subset='Company_Key', keep='first').set_index('Company_Key')
+n_dupes = n_before - len(company_data_map)
+if n_dupes:
+    print(f"Note: {n_dupes} company rows shared a cleaned key with another row and were "
+          f"collapsed to the first occurrence (their keys were too similar after cleaning).")
+
+company_choices = company_data_map.index.tolist()
+print(f"Ready to search. Matching {len(df_distributor)} records against {len(company_choices)} unique targets.")
+
+# ============================================================
+# Step 6: Find Matches (Hybrid Scoring, blocked by first letter)
+# ============================================================
+tqdm.pandas(desc="Finding Matches (Hybrid Score)")
+
+# Optional but recommended for larger datasets: bucket company choices by
+# the first character of the cleaned key. This limits each distributor row
+# to comparing only against plausible candidates instead of the full list,
+# which can cut runtime by an order of magnitude with minimal precision loss.
+USE_BLOCKING = True
+
+if USE_BLOCKING:
+    blocks = {}
+    for key in company_choices:
+        bucket = key[0] if key else ''
+        blocks.setdefault(bucket, []).append(key)
+
+def get_candidate_pool(dist_key):
+    if not USE_BLOCKING:
+        return company_choices
+    bucket = dist_key[0] if dist_key else ''
+    # Fall back to the full list if the bucket is missing or tiny, so we
+    # don't lose matches purely due to a typo in the first letter.
+    pool = blocks.get(bucket, [])
+    return pool if len(pool) >= 5 else company_choices
+
+
+def find_hybrid_matches(dist_key, score_cutoff=40, limit=3):
+    """
+    Custom hybrid matcher combining:
+      - token_set_ratio  (flexible: handles scattered/extra words)
+      - token_sort_ratio (strict: handles word order & spelling)
+    """
+    if not dist_key:
+        return None
+
+    candidate_pool = get_candidate_pool(dist_key)
+
+    candidates = process.extract(
+        dist_key,
+        candidate_pool,
+        scorer=fuzz.token_set_ratio,
+        score_cutoff=score_cutoff,
+        limit=limit * 2,  # grab extra so we can re-rank by the hybrid score
+    )
+
+    if not candidates:
+        return None
+
+    final_results = []
+    for candidate_text, set_score, _ in candidates:
+        sort_score = fuzz.token_sort_ratio(dist_key, candidate_text)
+        # Weighted blend: token_set_ratio matters more for messy Arabic data
+        hybrid_score = (set_score * 0.6) + (sort_score * 0.4)
+
+        if hybrid_score >= score_cutoff:
+            final_results.append((candidate_text, round(hybrid_score, 1), set_score, sort_score))
+
+    final_results.sort(key=lambda x: x[1], reverse=True)
+    return final_results[:limit]
+
+
+df_distributor['Matches'] = df_distributor['Distributor_Key'].progress_apply(
+    lambda x: find_hybrid_matches(x, score_cutoff=40, limit=3)
+)
+
+# ============================================================
+# Step 7: Explode Results
+# ============================================================
+print("Exploding results...")
+df_results = df_distributor.dropna(subset=['Matches']).copy()
+df_results = df_results.explode('Matches')
+
+if not df_results.empty:
+    def _get(tup, i):
+        return tup[i] if isinstance(tup, (list, tuple)) else None
+
+    df_results['Matched_Company_Key'] = df_results['Matches'].apply(lambda x: _get(x, 0))
+    df_results['Hybrid_Score'] = df_results['Matches'].apply(lambda x: _get(x, 1))
+    df_results['Set_Score'] = df_results['Matches'].apply(lambda x: _get(x, 2))
+    df_results['Sort_Score'] = df_results['Matches'].apply(lambda x: _get(x, 3))
+else:
+    print("No matches found.")
+
+# ============================================================
+# Step 8: Join & Save
+# ============================================================
+if not df_results.empty:
+    final_df = pd.merge(
+        df_results,
+        company_data_map,
+        left_on='Matched_Company_Key',
+        right_index=True,
+        how='left',
+        suffixes=('_Distributor', '_Company'),
+    )
+
+    final_df = final_df.drop(columns=['Matches', 'Distributor_Key', 'Matched_Company_Key'])
+
+    # Sort so each distributor's best match appears first
+    sort_cols = [c for c in [DIST_NAME_COL] if c in final_df.columns]
+    if sort_cols:
+        final_df = final_df.sort_values(sort_cols + ['Hybrid_Score'], ascending=[True, False])
+
+    try:
+        output_name = "Fuzzy_Lookup_Advanced_Hybrid.xlsx"
+        final_df.to_excel(output_name, index=False)
+        print(f"\nSuccessfully saved results to '{output_name}'")
+        print(f"Found {len(final_df)} potential matches using Hybrid Scoring.")
+        print(f"Score distribution:\n{final_df['Hybrid_Score'].describe()}")
+    except Exception as e:
+        print(f"\nError saving file: {e}")
+else:
+    print("Script finished. No matches.")
